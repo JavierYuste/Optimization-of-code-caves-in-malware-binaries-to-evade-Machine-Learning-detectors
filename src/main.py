@@ -1,0 +1,844 @@
+import argparse
+import json
+import logging
+import mmap
+import os
+import random
+import shutil
+import signal
+import threading
+import time
+from json import encoder
+import pefile
+import r2pipe
+from deap import base
+from deap import creator
+from deap import tools
+
+from malconv_nn import malconv
+
+encoder.FLOAT_REPR = lambda o: format(o, '.2f')
+logging.basicConfig(format='%(asctime)s [%(levelname)s]: %(message)s', datefmt='%m/%d %I:%M:%S', level=logging.DEBUG)
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-b', '--binary', help='Binary file', type=str,
+                    default='')
+parser.add_argument('-p', '--path', help='Path directory containing samples', type=str,
+                    default='')
+parser.add_argument('-s', '--statistics-dump', help='File to store statistics', type=str,
+                    default='testing.json')
+parser.add_argument('-sr', '--statistics-dump-rate', help='Rate to store statistics', type=int, default=1)
+parser.add_argument('-o', '--output', help='Folder to save modified binaries', type=str, default='')
+parser.add_argument('-nn', '--neural-network', help='NN to predict maliciousness', type=str, default='malconv.h5')
+parser.add_argument('-c', '--checkpoint', help='Continue from statistics file info', action="store_true")
+
+
+class NotPE(Exception):
+    pass
+
+
+class InvalidArgs(Exception):
+    pass
+
+
+class InvalidExpandingSectionsReq(Exception):
+    pass
+
+
+class r2_bind():
+    def __init__(self, binary):
+        self.closed = True
+        self.open_r2_pe(binary)
+
+    def get_number_of_sections(self):
+        return self.r2.cmdj("iSj")
+
+    def run_cmdj(self, cmd):
+        if not self.closed:
+            return self.r2.cmdj(cmd)
+        else:
+            return None
+
+    def is_closed(self):
+        return self.closed
+
+    def close(self):
+        try:
+            self.r2.quit()
+        except:
+            pass
+        try:
+            self.r2n.quit()
+        except:
+            pass
+        try:
+            self.pe.close()
+        except:
+            pass
+        self.closed = True
+
+    def size_of_file(self):
+        return self.r2n.cmd("r")
+
+    def open_r2_pe(self, binary):
+        try:
+            self.binary = binary
+            self.pe = pefile.PE(binary, fast_load=True)
+            if not self.pe.is_exe():
+                self.pe.close()
+                raise NotPE()
+            elif self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[14].VirtualAddress != 0 or \
+                    self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[14].Size != 0:
+                self.pe.close()
+                raise NotPE()
+            self.r2n = r2pipe.open(binary, ['-2', '-n'])
+            logging.info("Binary size: " + str(int(self.r2n.cmd("r"))))
+            self.r2 = r2pipe.open(binary, ['-2'])
+            self.closed = False
+        except NotPE:
+            raise
+        except Exception:
+            raise
+
+    def reopen_r2_pe(self, binary=None):
+        if binary == None:
+            binary = self.binary
+        self.close()
+        self.open_r2_pe(binary)
+
+    def overwrite_file(self, binary):
+        shutil.copy(binary, self.binary)
+
+    def get_dict_spaces_prioritize_n(self, size, n, prioritize):
+        if size > 100 or size < 0:
+            raise Exception
+        bin_size = int(self.r2.cmd('r'))
+        desired_size = int(bin_size * (size * 0.01))
+        pieces = int(desired_size / self.pe.OPTIONAL_HEADER.FileAlignment)
+
+        dict_spaces = {}
+        sections_info = self.r2.cmdj('iSj')
+        for counter, section in enumerate(sections_info):
+            dict_spaces[counter] = 0
+
+        count = 0
+        while pieces > 0:
+            if sections_info[n]['size'] > 0 and sections_info[n]['paddr'] > 0 and \
+                    random.randint(0, 100) < prioritize:
+                dict_spaces[n] += self.pe.OPTIONAL_HEADER.FileAlignment
+            else:
+                section = count % len(sections_info)
+                if section == n:
+                    section += 1
+                    count += 1
+                if sections_info[section]['size'] > 0 and sections_info[section]['paddr'] > 0:
+                    dict_spaces[section] += self.pe.OPTIONAL_HEADER.FileAlignment
+                    pieces -= 1
+                count += 1
+
+        return dict_spaces
+
+    def get_dict_spaces(self, size, section_expand=0):
+        if size > 100 or size < 0:
+            raise Exception
+        bin_size = int(self.r2.cmd('r'))
+        desired_size = int(bin_size * (size * 0.01))
+        pieces = max(int(desired_size / self.pe.OPTIONAL_HEADER.FileAlignment), 1)
+
+        dict_spaces = {}
+        sections_info = self.r2.cmdj('iSj')
+        for counter, section in enumerate(sections_info):
+            dict_spaces[counter] = 0
+
+        if section_expand == -1:
+            count = 0
+            while pieces > 0:
+                section = count % len(sections_info)
+                if sections_info[section]['size'] > 0 and sections_info[section]['paddr'] > 0:
+                    dict_spaces[section] += self.pe.OPTIONAL_HEADER.FileAlignment
+                    pieces -= 1
+                count += 1
+        elif sections_info[section_expand]['size'] > 0 and sections_info[section_expand]['paddr'] > 0:
+            while pieces > 0:
+                dict_spaces[section_expand] += self.pe.OPTIONAL_HEADER.FileAlignment
+                pieces -= 1
+        else:
+            dict_spaces[0] = 9999999999999999
+
+        return dict_spaces
+
+    def round_up_file_alignment(self, size):
+        logging.debug("Requested rounding up to file alignment of %s", str(size))
+        if (size % self.pe.OPTIONAL_HEADER.FileAlignment):
+            size = (int(size / self.pe.OPTIONAL_HEADER.FileAlignment) + (
+                    size % self.pe.OPTIONAL_HEADER.FileAlignment > 0)) * self.pe.OPTIONAL_HEADER.FileAlignment
+            logging.debug("Rounded up to %s", str(size))
+        else:
+            logging.debug("Did not have to round")
+        return size
+
+    def round_up_virtual_alignment(self, size):
+        logging.debug("Requested rounding up to section alignment of %s", str(size))
+        if (size % self.pe.OPTIONAL_HEADER.SectionAlignment):
+            size = (int(size / self.pe.OPTIONAL_HEADER.SectionAlignment) + (
+                    size % self.pe.OPTIONAL_HEADER.SectionAlignment > 0)) * self.pe.OPTIONAL_HEADER.SectionAlignment
+            logging.debug("Rounded up to %s", str(size))
+        else:
+            logging.debug("Did not have to round")
+        return size
+
+    def expand_sections_inserting(self, spaces, section_data_):
+        try:
+            sections_info = self.r2.cmdj('iSj')
+            if len(spaces) > len(sections_info):
+                raise InvalidExpandingSectionsReq("[!] Sections expansion requests are greater than binary sections")
+            for i in range(0, len(sections_info)):
+                if (spaces[i] % self.pe.OPTIONAL_HEADER.FileAlignment):
+                    logging.info(
+                        "[!] WARNING: expanding space requested ({}) is not file aligned, rounding it up".format(
+                            str(spaces[i])))
+                    spaces[i] = (int(spaces[i] / self.pe.OPTIONAL_HEADER.FileAlignment) +
+                                 (spaces[i] % self.pe.OPTIONAL_HEADER.FileAlignment > 0)) * \
+                                self.pe.OPTIONAL_HEADER.FileAlignment
+                    logging.info("[!] New Value: {}".format(str(spaces[i])))
+
+            self.close()
+            r2_w = r2pipe.open(self.binary, ['-2', '-n', '-w'])
+
+            chunksize = 2048
+            size_to_add = 0
+            for counter, section in enumerate(sections_info):
+
+                if spaces[counter] > 0 and sections_info[counter]['size'] > 0 and sections_info[counter]['paddr'] > 0:
+                    addr = sections_info[counter]['paddr'] + size_to_add
+                    size_to_add += spaces[counter]
+
+                    pieces = int(spaces[counter] / chunksize)
+                    for _ in range(pieces):
+                        r2_w.cmd('weN ' + str(addr) + ' ' + str(chunksize))
+                        addr += chunksize
+
+                    last_piece = int(spaces[counter] % chunksize)
+                    if last_piece > 0:
+                        r2_w.cmd('weN ' + str(addr) + ' ' + str(last_piece))
+
+            r2_w.quit()
+            logging.debug("Fixing headers")
+            result = self.fix_headers(self.binary, spaces, sections_info, section_data_)
+            r2n = r2pipe.open(self.binary, ['-2', '-n'])
+            logging.info("Binary size: " + str(int(r2n.cmd("r"))))
+            r2n.quit()
+            self.close()
+
+        except InvalidExpandingSectionsReq:
+            raise
+        except Exception as e:
+            print(e)
+        finally:
+            if 'result' in locals():
+                logging.debug('Done!')
+                return result
+
+    def fix_headers(self, binary, spaces, sections_info, section_data_):
+        try:
+            pe = pefile.PE(binary, fast_load=True)
+            size_to_add = 0
+            result = {}
+            for counter, section in enumerate(pe.sections):
+                size_to_add += spaces[counter]
+
+                if pe.sections[counter].PointerToRawData > 0 and pe.sections[counter].SizeOfRawData > 0:
+                    pe.sections[counter].PointerToRawData += size_to_add
+                    section_data_['sections'][sections_info[counter]['name']]['start_p_address'] += size_to_add
+
+                section_info = {}
+                section_info['size'] = spaces[counter]
+                section_info['start_p_address'] = pe.sections[counter].PointerToRawData - spaces[counter]
+                result[counter] = section_info
+
+            pe.write(f"{binary}.tmp")
+            pe.close()
+            shutil.copy(f"{binary}.tmp", binary)
+            os.remove(f"{binary}.tmp")
+
+            return result
+        except Exception as e:
+            logging.exception(e)
+            if 'pe' in locals():
+                pe.close()
+            raise Exception
+
+    def get_expand_sections(self, data, size, section_expand=0):
+        spaces = self.get_dict_spaces(size, section_expand)
+        if spaces[0] == 9999999999999999:
+            return None
+        else:
+            return self.expand_sections_inserting(spaces, data)
+
+    def expand_single_section(self, spaces):
+        try:
+            sections_info = self.r2.cmdj('iSj')
+            for i in range(0, len(sections_info)):
+                if (spaces[i] % self.pe.OPTIONAL_HEADER.FileAlignment):
+                    logging.info(
+                        "[!] WARNING: expanding space requested ({}) is not file aligned, rounding it up".format(
+                            str(spaces[i])))
+                    spaces[i] = (int(spaces[i] / self.pe.OPTIONAL_HEADER.FileAlignment) + (spaces[
+                                                                                               i] % self.pe.OPTIONAL_HEADER.FileAlignment > 0)) * self.pe.OPTIONAL_HEADER.FileAlignment
+                    logging.info("[!] New Value: {}".format(str(spaces[i])))
+
+            f = open(self.binary, "r+b")
+            mm = mmap.mmap(f.fileno(), 0, mmap.ACCESS_WRITE)
+
+            if args.output != None and args.output != '':
+                fout = open(args.output + os.path.basename(self.binary), "w+b")
+            else:
+                fout = open(self.binary + ".copy", "w+b")
+
+            for counter, section in enumerate(sections_info):
+                if sections_info[counter]['size'] > 0 and sections_info[counter]['paddr'] > 0:
+                    initial_address = sections_info[counter]['paddr']
+                    data = mm.read(initial_address)
+                    fout.write(data)
+                    break
+
+            chunksize = 2048
+
+            pieces = int(spaces[counter] / chunksize)
+            for _ in range(pieces):
+                fout.write(b'\x00' * chunksize)
+
+            last_piece = int(spaces[counter] % chunksize)
+            if last_piece > 0:
+                fout.write(b'\x00' * last_piece)
+
+            while mm.size() > (mm.tell() + chunksize):
+                data = mm.read(chunksize)
+                fout.write(data)
+
+            f.close()
+            fout.close()
+            mm.close()
+            if args.output != None and args.output != '':
+                self.reopen_r2_pe(args.output + os.path.basename(self.binary))
+            else:
+                self.overwrite_file(self.binary + ".copy")
+                self.reopen_r2_pe()
+            return initial_address
+
+        except InvalidExpandingSectionsReq:
+            raise
+        except Exception as e:
+            print(e)
+            if 'f' in locals():
+                if not f.closed:
+                    f.close()
+            if 'fout' in locals():
+                if not fout.closed:
+                    fout.close()
+            if 'mm' in locals():
+                if not mm.closed:
+                    mm.close()
+
+    def main(self, size, section_expand=0):
+        data = {}
+        data['sections'] = self.get_sections_spaces_aggressive()
+        data['expand'] = self.get_expand_sections(data=data, size=size, section_expand=section_expand)
+        return data
+
+    def get_sections_spaces_aggressive(self):
+        return self.get_sections_ph_padding()
+
+    def get_sections_ph_padding(self):
+        result = {}
+        sections_info = self.r2.cmdj('iSj')
+        for counter, section in enumerate(sections_info):
+            section_dict = {}
+            name = section['name']
+
+            if sections_info[counter]['size'] > 0 and sections_info[counter]['paddr'] > 0:
+                size = self.get_pattern_backwards_big_chunk_ph(section['paddr'] + section['size'], section['paddr'], 0)
+                size -= 16
+                start_p_address = section['paddr'] + section['size'] - size
+
+                section_dict['start_p_address'] = start_p_address
+                section_dict['size'] = size
+                result[name] = section_dict
+
+            else:
+                section_dict['start_p_address'] = 0
+                section_dict['size'] = 0
+                result[name] = section_dict
+        return result
+
+    def get_pattern_backwards_big_chunk_ph(self, start_addr, end_addr, pattern):
+        size = 4096
+        result = 0
+        while size > 1:
+            pattern_size = self.get_pattern_backwards_ph(start_addr, end_addr, pattern, size)
+            start_addr -= pattern_size
+            result += pattern_size
+            size = int(size / 2)
+        return result
+
+    def get_pattern_backwards_ph(self, start_addr, end_addr, pattern, size=4):
+        result = 0
+        stop = False
+        start_addr -= size
+        while not stop and start_addr >= end_addr:
+            hex_bytes = self.r2n.cmdj('pxj ' + str(size) + ' @' + str(start_addr))
+            for byte in hex_bytes:
+                if byte != pattern:
+                    stop = True
+                    break
+            if not stop:
+                result += size
+                start_addr -= size
+        return result
+
+
+class Timeout():
+    class Timeout(Exception):
+        pass
+
+    def __init__(self, sec):
+        self.sec = sec
+
+    def __enter__(self):
+        signal.signal(signal.SIGALRM, self.raise_timeout)
+        signal.alarm(self.sec)
+
+    def __exit__(self, *args):
+        signal.alarm(0)
+
+    def raise_timeout(self, *args):
+        raise Timeout.Timeout()
+
+
+class report_json_class():
+    def __init__(self, file, dump_rate, checkpoint=False):
+        self.file = file
+        self.data = {}
+        self.semaphore = threading.BoundedSemaphore(value=1)
+        self.dump_rate = dump_rate
+        self.recover_from_file(checkpoint)
+
+    def save_prediction(self, sample, old_prediction, new_prediction, iteration, cpu_time, spaces, size):
+        with self.semaphore:
+            predictions = {}
+            predictions['clean'] = str(old_prediction)
+            predictions['obfuscated'] = str(new_prediction)
+            predictions['generation'] = str(iteration)
+            predictions['cpu_time'] = cpu_time
+            predictions['spaces'] = spaces
+            predictions['size'] = size
+            self.data[sample] = predictions
+            self.dump_to_file()
+
+    def dump_to_file(self):
+        with open(self.file, 'w') as f:
+            json.dump(self.data, f)
+        logging.debug("Dumped info to file " + str(self.file))
+
+    def recover_from_file(self, checkpoint):
+        try:
+            self.already_taken_files = []
+            if checkpoint:
+                with open(self.file, 'r') as f:
+                    predictions = json.load(f)
+                for sample in predictions:
+                    self.already_taken_files.append(sample)
+                    self.data[sample] = predictions[sample]
+        except Exception as e:
+            logging.exception('An error occurred while trying to recover checkpoint from ' + str(self.file))
+            logging.error(e, exc_info=True)
+
+
+class DEAP_implementation():
+    def __init__(self, binary, spaces, NN, CXPB=0.6, MUTPBI=0.1, MUTPBII=0.1, mutation=2):
+        self.binary = binary
+        self.spaces = spaces
+        self.NN = NN
+        self.closed = True
+        self.best_fitness_per_g = []
+        self.undetected = False
+        self.best_individual = None
+        self.best_pred = 1.0
+        self.toolbox = base.Toolbox()
+        self.CXPB = CXPB
+        self.MUTPBI = MUTPBI
+        self.MUTPBII = MUTPBII
+        self.cpu_time = time.perf_counter()
+        self.mutation = mutation
+
+    def register_tools(self):
+        length_individual = self.size_array_of_spaces()
+        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        creator.create("Individual", list, fitness=creator.FitnessMax)
+
+        self.toolbox.register("attr_bool", random.randint, 0, 255)
+        self.toolbox.register("individual", tools.initRepeat, creator.Individual,
+                              self.toolbox.attr_bool, length_individual)
+        self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
+        self.toolbox.register("evaluate", self.fitness_individual)
+        self.toolbox.register("crossover", self.crossover)
+        self.toolbox.register("mutate", self.mutate, indpb=self.MUTPBII)
+        self.toolbox.register("select_elitism", tools.selBest)
+        self.toolbox.register("select_tournament", tools.selTournament, tournsize=10)
+        self.toolbox.register("select_roulette", tools.selRoulette)
+
+    def unregister_tools(self):
+        self.toolbox.unregister("attr_bool")
+        self.toolbox.unregister("individual")
+        self.toolbox.unregister("population")
+        self.toolbox.unregister("evaluate")
+        self.toolbox.unregister("mutate")
+        self.toolbox.unregister("select_elitism")
+        self.toolbox.unregister("select_tournament")
+
+    def optimize(self, population_size=50, block_size=32, filename=""):
+        self.register_tools()
+
+        self.initial_cpu_time = time.perf_counter()
+        self.counter_timestamp = 1
+        self.stats_best_per_gen = ""
+
+        pop = self.toolbox.population(n=population_size)
+
+        fitnesses = list(map(self.toolbox.evaluate, pop))
+        for ind, fit in zip(pop, fitnesses):
+            ind.fitness.values = fit
+
+        fits = [ind.fitness.values[0] for ind in pop]
+        self.best_fitness_per_g.append(1 - max(fits))
+
+        g = 0
+
+        while self.check_continue(g):
+            logging.info("-- Generation " + str(g) + " " + str(filename) + " --")
+            g = g + 1
+
+            elitism_group = list(map(self.toolbox.clone, tools.selBest(pop, 5)))
+            for ind in elitism_group:
+                pop.remove(ind)
+            tournament_group = list()
+            while len(tournament_group) < 5:
+                ind = list(map(self.toolbox.clone, tools.selTournament(pop, 1, tournsize=10)))
+                pop.remove(ind[0])
+                tournament_group.append(ind[0])
+
+            offspring = list()
+            for elitist_ind in elitism_group:
+                for tournament_ind in tournament_group:
+                    mate_1 = self.toolbox.clone(elitist_ind)
+                    mate_2 = self.toolbox.clone(tournament_ind)
+                    curr_offspring_ = self.toolbox.crossover(mate_1, mate_2, 2, block_size)
+
+                    for mate_offspring in curr_offspring_:
+                        offspring.append(mate_offspring)
+            logging.debug("Done crossover. Offspring length: " + str(len(offspring)))
+
+            offspring = list(map(self.toolbox.clone, offspring))
+            offspring_mut = list()
+            for mutant in offspring:
+                if random.random() < self.MUTPBI:
+                    mutant = self.toolbox.mutate(mutant)
+                offspring_mut.append(mutant)
+            logging.debug("Done mutation")
+
+            offspring = list(map(self.toolbox.clone, offspring_mut))
+
+            invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
+            fitnesses = map(self.toolbox.evaluate, invalid_ind)
+            for ind, fit in zip(invalid_ind, fitnesses):
+                ind.fitness.values = fit
+            logging.debug("Reevaluated fitnesses")
+
+            pop = tools.selBest(offspring, population_size - 1)
+            for ind in tools.selBest(elitism_group, 1):
+                pop.append(ind)
+            del fitnesses
+            del offspring
+            del offspring_mut
+            del elitism_group
+            del tournament_group
+
+            logging.debug("Cleared worst individuals")
+            logging.debug("Copied next population. Pop length: " + str(len(pop)))
+
+            fits = [ind.fitness.values[0] for ind in pop]
+            self.best_fitness_per_g.append(1 - max(fits))
+
+            length = len(pop)
+            mean = sum(fits) / length
+            sum2 = sum(x * x for x in fits)
+            std = abs(sum2 / length - mean ** 2) ** 0.5
+
+            logging.info("  Length " + str(length))
+            logging.info("  Min %s" % (1 - max(fits)))
+            logging.info("  Max %s" % (1 - min(fits)))
+            logging.info("  Avg %s" % (1 - mean))
+            logging.info("  Std %s" % std)
+
+        if self.undetected:
+            logging.info("Not detected!")
+        self.unregister_tools()
+        self.restore_best_one()
+        return g, self.undetected, self.stats_best_per_gen
+
+    def mutate(self, individual, indpb=0.2):
+        n_mutations = round(len(individual) * indpb)
+        places = random.sample(range(0, len(individual)), k=n_mutations)
+        for i in range(n_mutations):
+            individual[places[i]] = random.randint(0, 255)
+
+        return individual
+
+    def check_continue(self, generation):
+        if not self.undetected and (
+                generation < 50 or (self.best_fitness_per_g[-10] - self.best_fitness_per_g[-1]) > 0.01):
+            return True
+        else:
+            return False
+
+    def crossover(self, ind1, ind2, n_offspring, length_cx_blocks):
+        curr_offspring = list()
+        fitness_1 = 1 - ind1.fitness.values[0]
+        fitness_2 = 1 - ind2.fitness.values[0]
+        prob = 0
+        if (fitness_1 + fitness_2) != 0:
+            prob = 1 - (fitness_1 / (fitness_1 + fitness_2))
+        if prob is None or prob <= 0 or prob >= 1:
+            prob = 0.5
+        for i in range(0, n_offspring):
+            curr_individual = self.toolbox.clone(ind1)
+            del curr_individual.fitness.values
+            counter = 0
+
+            while counter < len(ind1):
+                size_data = min(length_cx_blocks, len(ind1) - counter)
+                if random.random() < prob:
+                    curr_individual[counter:(counter + size_data)] = ind1[counter:(counter + size_data)]
+                else:
+                    curr_individual[counter:(counter + size_data)] = ind2[counter:(counter + size_data)]
+                counter += size_data
+
+            curr_offspring.append(curr_individual)
+
+        return curr_offspring
+
+    def write_on_spaces_mmap(self, pop):
+        try:
+            f = open(self.binary, "r+b")
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_WRITE)
+            mm.flush()
+            self.close()
+
+            counter = 0
+            for expand in self.spaces['expand']:
+                if self.spaces['expand'][expand]['size'] > 0 and self.spaces['expand'][expand]['start_p_address'] > 0:
+                    data = pop[counter:(counter + self.spaces['expand'][expand]['size'])]
+                    size_data = self.spaces['expand'][expand]['size']
+                    counter += size_data
+                    data = bytes(data)
+                    address = self.spaces['expand'][expand]['start_p_address']
+                    mm.seek(address)
+                    written_bytes = mm.write(data)
+                    if written_bytes != len(data):
+                        logging.error("Error when writing data on the binary (data length [" + str(
+                            len(data)) + "] != written bytes [" + str(written_bytes) + "]")
+
+            mm.flush()
+            mm.close()
+            f.close()
+        except Exception as e:
+            logging.error(e)
+
+    def size_array_of_spaces(self):
+        size = 0
+        for expand in self.spaces['expand']:
+            size += self.spaces['expand'][expand]['size']
+
+        return size
+
+    def fitness_individual(self, individual):
+        self.write_on_spaces_mmap(individual)
+        pred = self.NN.predict(self.binary)
+        if pred < self.best_pred:
+            self.best_pred = pred
+            self.save_best_one(individual)
+            if self.best_pred < 0.5:
+                self.undetected = True
+
+        return (1 - pred,)
+
+    def is_closed(self):
+        return self.closed
+
+    def open_r2(self):
+        self.close()
+        self.r2 = r2pipe.open(self.binary, ['-2', '-n', '-w'])
+        self.closed = False
+        self.r2_virtual = False
+
+    def open_r2v(self):
+        self.close()
+        self.r2 = r2pipe.open(self.binary, ['-2', '-w'])
+        self.closed = False
+        self.r2_virtual = True
+
+    def close(self):
+        if not self.is_closed():
+            self.r2.quit()
+            self.closed = True
+
+    def save_best_one(self, individual):
+        self.best_individual = individual
+
+    def restore_best_one(self):
+        self.write_on_spaces_mmap(self.best_individual)
+
+
+def main(PATH, binary_name, nn, args):
+    try:
+        logging.info("Binary: " + str(binary_name))
+        cpu_time = time.perf_counter()
+        binary = PATH + binary_name
+        prediction1 = n_network.predict(binary)
+        logging.info("Initial prediction: [" + str(prediction1) + "]")
+
+        success = False
+        size = 1
+        shutil.copy(binary, f"{binary}incremental_original")
+        logging.info("Trying with size " + str(size) + "%")
+
+        while not success and size <= 100:
+            with Timeout(900):
+                logging.info("Opening binary")
+                logging.info("Size: " + str(size) + "%")
+                r2 = r2_bind(binary + "incremental_original")
+                logging.info("Expanding binary")
+                spaces = r2.main(size, args.section_expand)
+                try:
+                    r2.close()
+                except:
+                    pass
+
+            if spaces['expand'] is None:
+                print("[!] Spaces['expand'] is None")
+                iteration = 9999999999999999
+                success = True
+                predictions_time_marks = "1"
+                size = 9999999999999999
+            else:
+                genetic_optimization = DEAP_implementation(binary + "incremental_original", spaces, NN=n_network,
+                                                           mutation=args.mutation_method, MUTPBI=args.mutation_I,
+                                                           MUTPBII=args.mutation_II)
+                iteration, success, predictions_time_marks = genetic_optimization.optimize(filename=binary_name)
+
+            if not success:
+                if size < 15:
+                    size += 3
+                else:
+                    size += 10
+                logging.info("[!] Unsuccesful, incrementing size to " + str(size) + "%")
+                shutil.copy(binary, f"{binary}incremental_original")
+
+        if not success:
+            logging.info("[-] Did not find an evasive sample")
+            logging.debug("Restoring original sample")
+            path = os.path.abspath(f"{binary}incremental_original")
+            os.remove(path)
+        else:
+            logging.info("[+] Found an evasive sample!")
+            logging.debug("Deleting original sample")
+            shutil.copy(f"{binary}incremental_original", binary)
+            os.remove(f"{binary}incremental_original")
+
+        prediction2 = n_network.predict(binary)
+
+        cpu_time = time.perf_counter() - cpu_time
+
+        report_json.save_prediction(binary_name, prediction1, prediction2, iteration, cpu_time, spaces, size)
+
+    except NotPE:
+        logging.error('{} is not a valid pe file, skipping...'.format(str(binary_name)))
+    except Timeout:
+        logging.error("Timeout [{}]".format(str(binary_name)))
+    except Exception as e:
+        logging.error('An inexpected error has occurred in main')
+        logging.error(e, exc_info=True)
+    finally:
+        if 'r2' in locals():
+            if not r2.is_closed():
+                r2.close()
+        if 'genetic_optimization' in locals():
+            if not genetic_optimization.is_closed():
+                genetic_optimization.close()
+
+
+def base_test(test, configuration, neural_network):
+    try:
+        global args
+        args = parser.parse_args()
+        use_configuration(configuration)
+        if args.output is not None and args.output != '' and args.path[-1:] != '/':
+            args.output += '/'
+        global n_network
+        n_network = neural_network(args.neural_network)
+        global report_json
+        if args.checkpoint and os.path.isfile(args.statistics_dump):
+            report_json = report_json_class(args.statistics_dump, args.statistics_dump_rate, checkpoint=True)
+        else:
+            report_json = report_json_class(args.statistics_dump, args.statistics_dump_rate)
+        if args.path is None or args.path == '':
+            print("Give a path")
+            return
+        else:
+            if args.path[-1:] != '/':
+                args.path += '/'
+            PATH = args.path
+            files = os.listdir(PATH)
+            i = 0
+            for f in files:
+                i = i + 1
+                print(f"Processing file {i}/{len(files)} ({(i / len(files)) * 100} %)")
+                try:
+                    if f not in report_json.already_taken_files:
+                        test(PATH, f, n_network, args)
+                    else:
+                        logging.info('Skipping file bc of restored checkpoint [' + str(f) + ']')
+                except Exception as e:
+                    logging.exception('An exception occurred while calling main with file ' + str(f))
+                    logging.error(e, exc_info=True)
+
+            report_json.dump_to_file()
+
+    except Exception as e:
+        print(e)
+
+
+def use_configuration(configuration):
+    args.path = configuration['path']
+    args.statistics_dump = configuration['statistics_dump']
+    args.neural_network = configuration['neural_network']
+    args.cross = configuration['cross']
+    args.checkpoint = configuration['checkpoint']
+    args.mutation_I = configuration['mutation_I']
+    args.mutation_II = configuration['mutation_II']
+    args.mutation_method = configuration['mutation_method']
+    args.section_expand = configuration['section_expand']
+
+
+if __name__ == '__main__':
+    configuration = dict()
+    configuration['path'] = "/home/yuste/repos/samples_v2/revision_2/test_public_code (copy)"
+    configuration['statistics_dump'] = "stats.json"
+    configuration['neural_network'] = "malconv.h5"
+    configuration['cross'] = 4
+    configuration['checkpoint'] = False
+    configuration['mutation_I'] = 0.1
+    configuration['mutation_II'] = 0.1
+    configuration['mutation_method'] = 2
+    configuration['section_expand'] = -1
+    base_test(main, configuration, malconv)
